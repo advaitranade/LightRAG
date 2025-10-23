@@ -1,148 +1,116 @@
-# pip install -q -U google-generativeai sentence-transformers
-# Note: Use 'google-generativeai', not 'google-genai' for the modern client
-
 import os
-import numpy as np
-import google.generativeai as genai  # --- FIX: Use the full library ---
-from google.generativeai import types
-from dotenv import load_dotenv
-from lightrag.utils import EmbeddingFunc
-from lightrag import LightRAG, QueryParam
-from sentence_transformers import SentenceTransformer
-from lightrag.kg.shared_storage import initialize_pipeline_status
-
 import asyncio
-import nest_asyncio
+import google.generativeai as genai
+from lightrag.core.types import ModelClient, ModelOutput, LLMCompletionInput
+from lightrag.core.lightrag import LightRAG
+from lightrag.core.embedder import EmbeddingFunc
+from lightrag.core.types import QueryParam
+from lightrag.components.retriever import LLMRetriever
+from lightrag.components.generator import LLMGenerator
+from lightrag.utils.logger import TrivialLogger
 
-# Apply nest_asyncio to solve event loop issues
-nest_asyncio.apply()
+# --- This is the new part for Gemini ---
 
-load_dotenv()
-gemini_api_key = os.getenv("GEMINI_API_KEY")
+# 1. Configure the Gemini API client
+api_key = os.environ.get('GEMINI_API_KEY')
+if not api_key:
+    raise ValueError("GEMINI_API_KEY environment variable not set. Please set it in Render.")
 
-if not gemini_api_key:
-    raise ValueError("GEMINI_API_KEY not found. Please set it in your .env file or Render environment.")
+genai.configure(api_key=api_key)
 
-WORKING_DIR = "./dickens"
+class GeminiClient(ModelClient):
+    """A custom ModelClient for the Gemini API."""
+    def __init__(self, model_name: str = "gemini-1.5-flash"):
+        super().__init__()
+        self.model_name = model_name
+        self.model = genai.GenerativeModel(self.model_name)
 
-if os.path.exists(WORKING_DIR):
-    import shutil
-    shutil.rmtree(WORKING_DIR)
+    def call(self, input: LLMCompletionInput, **kwargs) -> ModelOutput:
+        """
+        Calls the Gemini API.
+        The 'input' object contains the prompt string.
+        """
+        try:
+            # input.prompt is the final prompt string
+            response = self.model.generate_content(input.prompt, **kwargs)
+            return ModelOutput(output=response.text)
+        except Exception as e:
+            print(f"Error calling Gemini: {e}")
+            return ModelOutput(output=None, error=str(e))
 
-os.mkdir(WORKING_DIR)
+    async def acall(self, input: LLMCompletionInput, **kwargs) -> ModelOutput:
+        """
+        Async version of the call.
+        """
+        try:
+            response = await self.model.generate_content_async(input.prompt, **kwargs)
+            return ModelOutput(output=response.text)
+        except Exception as e:
+            print(f"Error calling Gemini (async): {e}")
+            return ModelOutput(output=None, error=str(e))
 
-# --- FIX: Initialize models ONCE, globally ---
-# 1. Configure and initialize the Gemini model globally
-genai.configure(api_key=gemini_api_key)
-gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+# 2. Define the LLM function LightRAG will use
+# This function matches the signature LightRAG expects
+def gemini_llm_func(model_name: str = "gemini-1.5-flash", **kwargs) -> GeminiClient:
+    return GeminiClient(model_name=model_name, **kwargs)
 
-# 2. Initialize the embedding model globally
-embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
-# ---------------------------------------------
+# --- End of new Gemini part ---
 
+# --- Standard LightRAG setup (from other examples) ---
+# NOTE: This setup assumes you also have an embedding model.
+# You may need to replace this with your actual embedding function.
+# For simplicity, this example uses a placeholder.
+# If you use an OpenAI embedder, configure its API key in Render as well.
 
-async def llm_model_func(
-    prompt, system_prompt=None, history_messages=[], keyword_extraction=False, **kwargs
-) -> str:
-    
-    # --- FIX: Use the globally initialized model ---
-    # No need to create a new client here
+def get_mock_embedding_func(dim: int = 768):
+    def embed_func(texts: list[str]) -> list[list[float]]:
+        # A mock embedding function.
+        # REPLACE THIS with your actual embedding model (e.g., from OpenAI or HuggingFace)
+        print(f"Mock embedding {len(texts)} texts...")
+        import numpy as np
+        return [np.random.rand(dim).tolist() for _ in texts]
 
-    # 2. Combine prompts (your logic is good)
-    if history_messages is None:
-        history_messages = []
-
-    combined_prompt = ""
-    if system_prompt:
-        combined_prompt += f"{system_prompt}\n"
-
-    for msg in history_messages:
-        combined_prompt += f"{msg['role']}: {msg['content']}\n"
-    
-    combined_prompt += f"user: {prompt}"
-
-    # 3. Call the Gemini model using the ASYNCHRONOUS method
-    try:
-        # --- FIX: Use the async 'generate_content_async' ---
-        response = await gemini_model.generate_content_async(
-            contents=[combined_prompt],
-            generation_config=types.GenerationConfig(max_output_tokens=500, temperature=0.1),
-        )
-        return response.text
-    except Exception as e:
-        print(f"Error calling Gemini: {e}")
-        return f"Error: {e}"
-
-
-async def embedding_func(texts: list[str]) -> np.ndarray:
-    
-    # --- FIX: Use the globally initialized model ---
-    # model = SentenceTransformer("all-MiniLM-L6-v2") # <-- Remove this
-    
-    # 'model.encode' is synchronous (blocking). We must run it in a separate
-    # thread pool to avoid blocking the asyncio event loop.
-    
-    # --- FIX: Use asyncio.to_thread for blocking calls ---
-    loop = asyncio.get_running_loop()
-    embeddings = await loop.run_in_executor(
-        None,  # Use the default thread pool executor
-        lambda: embedding_model.encode(texts, convert_to_numpy=True)
-    )
-    return embeddings
-
+    return EmbeddingFunc(embedding_dim=dim, func=embed_func)
 
 async def initialize_rag():
+    """Initializes the LightRAG instance with the Gemini model."""
+    print("Initializing RAG with Gemini...")
+    
+    # 3. Pass the new function here:
     rag = LightRAG(
-        working_dir=WORKING_DIR,
-        llm_model_func=llm_model_func,
-        embedding_func=EmbeddingFunc(
-            embedding_dim=384,      # This model (all-MiniLM-L6-v2) has 384 dimensions
-            max_token_size=8192,  # This is fine
-            func=embedding_func,
-        ),
+        llm_model_func=gemini_llm_func,  # <--- THIS IS THE KEY CHANGE
+        embedding_func=get_mock_embedding_func(), # Replace with your embedder
+        working_dir="lightrag_gemini_data",
+        logger=TrivialLogger(),
     )
-
+    
     await rag.initialize_storages()
-    await initialize_pipeline_status()
-
+    # You might need this from other examples
+    # from lightrag.core.pipeline import initialize_pipeline_status
+    # await initialize_pipeline_status()
     return rag
 
+async def main():
+    rag = await initialize_rag()
 
-def main():
-    print("Initializing RAG...")
-    # Initialize RAG instance
-    rag = asyncio.run(initialize_rag())
+    # Insert some data
+    documents = [
+        "The capital of France is Paris.",
+        "The Eiffel Tower is a famous landmark in Paris.",
+        "Mars is the fourth planet from the Sun."
+    ]
+    await rag.ainsert(documents)
+    print("Documents inserted.")
+
+    # Query using Gemini
+    query = "What is the capital of France?"
+    print(f"\nQuerying: {query}")
     
-    # --- FIX: Create a dummy story.txt file for the demo ---
-    file_path = "story.txt"
-    try:
-        with open(file_path, "w") as file:
-            file.write("A brave knight named Sir Reginald lived in a castle. ")
-            file.write("He had a loyal dragon named Sparky. ")
-            file.write("Together, they defended the kingdom from a grumpy giant. ")
-            file.write("The main theme is about friendship and courage.")
-        
-        with open(file_path, "r") as file:
-            text = file.read()
-        
-        print("Inserting text...")
-        rag.insert(text)
-        print("Text inserted.")
-
-        print("Querying...")
-        response = rag.query(
-            query="What is the main theme of the story?",
-            param=QueryParam(mode="hybrid", top_k=5, response_type="single line"),
-        )
-
-        print("\n--- Response ---")
-        print(response)
-        print("------------------\n")
-        
-    finally:
-        # Clean up the dummy file
-        if os.path.exists(file_path):
-            os.remove(file_path)
+    param = QueryParam(mode="naive", user_prompt="Answer the question based only on the provided context.")
+    response = await rag.aquery(query, param=param)
+    
+    print("\nGemini Response:")
+    print(response)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
